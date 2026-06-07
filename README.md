@@ -34,6 +34,7 @@ func main() {
 ```
 
 After `Dial`ing the server, you should install stream filters. Stream filters allow you to capture only certain types of GPSD reports.
+Filters can be removed via `RemoveFilter` (When using the same instance) or cleared via `ClearFilters`.
 
 ```go
 gps.AddFilter("TPV", tpvFilter)
@@ -50,16 +51,30 @@ tpvFilter := func(r interface{}) {
 
 Due to the nature of GPSD reports your filter will manually have to cast the type of the argument it received to a proper `*gpsd.Report` struct pointer.
 
-After installing all needed filters, call the `Watch` method to start observing reports. Please note that at this time installed filters can't be removed.
+After installing all needed filters, call the `Watch` method to start observing reports.
 
 ```go
-done := gps.Watch()
-<-done
+err = gps.Watch()
+if err != nil {
+    panic(fmt.Sprintf("Failed to watch GPSD: %s", err))
+}
+
 // ...some time later...
-gps.Close()
+gps.Close() // Not needed if waiting for session to die
 ```
 
-`Watch()` spans a new goroutine in which all data processing will happen, `done` doesn't send anything.
+`Watch()` spans a new goroutine in which all data processing will happen.
+
+To wait for the session to end, call the `Wait` method which will return the reason for the end of session (Or `nil` when closed via `Close`).
+
+```go
+err = gps.Wait()
+if err != nil {
+    panic(fmt.Sprintf("GPSD session error: %s", err))
+}
+```
+
+
 
 ### Currently supported GPSD report types
 

@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"github.com/stratoberry/go-gpsd"
+)
 
 func main() {
 	var gps *gpsd.Session
@@ -23,6 +26,13 @@ func main() {
 
 	gps.AddFilter("SKY", skyfilter)
 
-	done := gps.Watch()
-	<-done
+	err = gps.Watch()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to watch GPSD: %s", err))
+	}
+
+	err = gps.Wait()
+	if err != nil {
+		panic(fmt.Sprintf("GPSD session error: %s", err))
+	}
 }

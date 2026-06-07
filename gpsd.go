@@ -7,8 +7,22 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"sync"
 	"time"
 )
+
+// ErrNotWatching not watching
+var ErrNotWatching = errors.New("not watching")
+
+// ErrTimedOut timed out
+var ErrTimedOut = errors.New("timed out")
+
+// ErrConnNil conn is nil
+var ErrConnNil = errors.New("conn is nil")
+
+// ErrConnClosed conn is closed
+var ErrConnClosed = errors.New("conn is closed")
 
 // DefaultAddress of gpsd (localhost:2947)
 const DefaultAddress = "localhost:2947"
@@ -20,7 +34,10 @@ type Filter func(interface{})
 type Session struct {
 	socket  net.Conn
 	reader  *bufio.Reader
+	flock   sync.RWMutex
 	filters map[string][]Filter
+	cond    sync.Cond
+	fErr    error
 }
 
 // Mode describes status of a TPV report
@@ -195,49 +212,124 @@ type Satellite struct {
 	Health float64 `json:"health"`
 }
 
-// Dial opens a new connection to GPSD.
+// Attach create a session from a net.Conn
+func Attach(conn net.Conn) (*Session, error) {
+	if conn == nil {
+		return nil, ErrConnNil
+	}
+	return dialCommon(conn, nil)
+}
+
+// Dial opens a new  ipv4 connection to GPSD.
 func Dial(address string) (*Session, error) {
 	return dialCommon(net.Dial("tcp4", address))
 }
 
-// DialTimeout opens a new connection to GPSD with a timeout.
+// DialIPv6 opens a new  ipv6 connection to GPSD.
+func DialIPv6(address string) (*Session, error) {
+	return dialCommon(net.Dial("tcp6", address))
+}
+
+// DialTimeout opens a new ipv4 connection to GPSD with a timeout for waiting to connect.
 func DialTimeout(address string, to time.Duration) (*Session, error) {
 	return dialCommon(net.DialTimeout("tcp4", address, to))
 }
 
+// DialIPv6Timeout opens a new ipv6 connection to GPSD with a timeout for waiting to connect.
+func DialIPv6Timeout(address string, to time.Duration) (*Session, error) {
+	return dialCommon(net.DialTimeout("tcp6", address, to))
+}
+
 func dialCommon(c net.Conn, err error) (session *Session, e error) {
-	session = new(Session)
-	session.socket = c
 	if err != nil {
 		return nil, err
 	}
 
-	session.reader = bufio.NewReader(session.socket)
-	session.reader.ReadString('\n')
-	session.filters = make(map[string][]Filter)
+	session = &Session{
+		socket:  c,
+		reader:  nil,
+		filters: make(map[string][]Filter),
+		cond:    sync.Cond{L: &sync.Mutex{}},
+	}
 
 	return
 }
 
 // Watch starts watching GPSD reports in a new goroutine.
+// Use Activate for a custom watch command
 //
 // Example:
 //
 //	gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
-//	done := gpsd.Watch()
-//	<- done
-func (s *Session) Watch() (done chan bool) {
-	fmt.Fprintf(s.socket, "?WATCH={\"enable\":true,\"json\":true}")
-	done = make(chan bool)
+//	_ := gpsd.Watch()
+func (s *Session) Watch() error {
+	return s.Activate("WATCH={\"enable\":true,\"json\":true,\"nmea\":false,\"raw\":0,\"scaled\":false,\"timing\":true,\"split24\":false,\"pps\":true}")
+}
 
-	go watch(done, s)
+// Activate with a custom command unlike Watch
+func (s *Session) Activate(customCommand string) error {
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
 
-	return
+	if s.reader != nil {
+		return nil
+	}
+
+	if s.socket == nil {
+		return ErrConnClosed
+	}
+
+	s.reader = bufio.NewReader(s.socket)
+
+	var err error
+	/*_, err = s.reader.ReadString('\n')
+	if err != nil {
+		_ = s.socket.Close()
+		return err
+	}*/
+
+	_, err = fmt.Fprintf(s.socket, "?"+customCommand+";")
+	if err != nil {
+		defer func() {
+			s.socket = nil
+			s.reader = nil
+		}()
+		_ = s.socket.Close()
+		return err
+	}
+
+	go s.watch()
+
+	return err
+}
+
+func (s *Session) IsWatching() bool {
+	return s.socket != nil && s.reader != nil
+}
+
+// Wait for the session to close returning an error if any, returns ErrNotWatching if Watch has not been run
+func (s *Session) Wait() error {
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
+	if s.socket == nil {
+		return ErrConnClosed
+	}
+	if s.reader == nil {
+		return ErrNotWatching
+	}
+	s.cond.Wait()
+	return s.fErr
 }
 
 // SendCommand sends a command to GPSD
-func (s *Session) SendCommand(command string) {
-	fmt.Fprintf(s.socket, "?"+command+";")
+func (s *Session) SendCommand(command string) error {
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
+	if s.socket == nil {
+		return ErrConnClosed
+	}
+	_, err := fmt.Fprintf(s.socket, "?"+command+";")
+	return err
 }
 
 // AddFilter attaches a function which will be called for all
@@ -250,22 +342,53 @@ func (s *Session) SendCommand(command string) {
 //	  report := r.(*gpsd.TPVReport)
 //	  fmt.Println(report.Time, report.Lat, report.Lon)
 //	})
-//	done := gps.Watch()
-//	<- done
+//	_ = gps.Watch()
 func (s *Session) AddFilter(class string, f Filter) {
+	s.flock.Lock()
+	defer s.flock.Unlock()
 	s.filters[class] = append(s.filters[class], f)
 }
 
+// RemoveFilter removes a specified filter instance added by AddFilter of a specified class
+func (s *Session) RemoveFilter(class string, f Filter) {
+	s.flock.Lock()
+	defer s.flock.Unlock()
+	n := make([]Filter, 0, len(s.filters[class]))
+	for _, filter := range s.filters[class] {
+		if reflect.ValueOf(filter).Pointer() != reflect.ValueOf(f).Pointer() {
+			n = append(n, filter)
+		}
+	}
+	s.filters[class] = n
+}
+
+// ClearFilters clears all filters added by AddFilter of a specified class
+func (s *Session) ClearFilters(class string) {
+	s.flock.Lock()
+	defer s.flock.Unlock()
+	s.filters[class] = []Filter{}
+}
+
 func (s *Session) deliverReport(class string, report interface{}) {
+	s.flock.RLock()
+	defer s.flock.RUnlock()
 	for _, f := range s.filters[class] {
 		f(report)
 	}
 }
 
+func (s *Session) filterCount(class string) int {
+	s.flock.RLock()
+	defer s.flock.RUnlock()
+	return len(s.filters[class])
+}
+
 // Close closes the connection to GPSD
 func (s *Session) Close() error {
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
 	if s.socket == nil {
-		return errors.New("gpsd socket is alerady closed")
+		return ErrConnClosed
 	}
 
 	if err := s.socket.Close(); err != nil {
@@ -273,39 +396,52 @@ func (s *Session) Close() error {
 	}
 
 	s.socket = nil
+	if s.reader == nil {
+		s.cond.Broadcast()
+	} else {
+		s.cond.Wait()
+	}
 	return nil
 }
 
-func watch(done chan bool, s *Session) {
+func (s *Session) watch() {
 	// We're not using a JSON decoder because we first need to inspect
 	// the JSON string to determine it's "class"
+	defer func() {
+		s.cond.L.Lock()
+		defer s.cond.L.Unlock()
+		defer s.cond.Broadcast()
+		if s.socket != nil {
+			defer func() { s.socket = nil }()
+			_ = s.socket.Close()
+		}
+	}()
 	for {
 		if line, err := s.reader.ReadString('\n'); err == nil {
 			var reportPeek gpsdReport
 			lineBytes := []byte(line)
 			if err = json.Unmarshal(lineBytes, &reportPeek); err == nil {
-				if len(s.filters[reportPeek.Class]) == 0 {
+				if s.filterCount(reportPeek.Class) == 0 {
 					continue
 				}
 
 				if report, err2 := unmarshalReport(reportPeek.Class, lineBytes); err2 == nil {
 					s.deliverReport(reportPeek.Class, report)
 				} else {
-					fmt.Println("JSON parsing error 2:", err)
+					s.fErr = fmt.Errorf("JSON parsing error 2: %w", err)
 				}
 			} else {
-				fmt.Println("JSON parsing error:", err)
+				s.fErr = fmt.Errorf("JSON parsing error: %w", err)
 			}
 		} else {
 			if !errors.Is(err, net.ErrClosed) {
-				fmt.Println("Stream reader error (is gpsd running?):", err)
+				s.fErr = fmt.Errorf("stream reader error (is gpsd running?): %w", err)
 			}
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				break
 			}
 		}
 	}
-	done <- true
 }
 
 func unmarshalReport(class string, bytes []byte) (interface{}, error) {
