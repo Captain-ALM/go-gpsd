@@ -436,17 +436,18 @@ func (s *Session) Close() error {
 		return ErrConnClosed
 	}
 
-	if err := s.socket.Close(); err != nil {
-		return err
-	}
+	err := s.socket.Close()
 
 	s.socket = nil
 	if s.reader == nil {
 		s.cond.Broadcast()
 	} else {
+		if err != nil {
+			return err
+		}
 		s.cond.Wait()
 	}
-	return nil
+	return err
 }
 
 func (s *Session) watch() {
