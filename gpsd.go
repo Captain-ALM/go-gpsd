@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"reflect"
@@ -372,6 +371,9 @@ func (s *Session) SendCommand(command string) error {
 		_ = s.socket.SetWriteDeadline(time.Now().Add(s.timeout))
 	}
 	_, err := fmt.Fprintf(s.socket, "?"+command+";")
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return ErrTimedOut
+	}
 	return err
 }
 
@@ -475,9 +477,11 @@ func (s *Session) watch() {
 					s.deliverReport(reportPeek.Class, report)
 				} else {
 					s.fErr = fmt.Errorf("JSON parsing error 2: %w", err)
+					break
 				}
 			} else {
 				s.fErr = fmt.Errorf("JSON parsing error: %w", err)
+				break
 			}
 		} else {
 			if !errors.Is(err, net.ErrClosed) {
@@ -486,9 +490,7 @@ func (s *Session) watch() {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				s.fErr = ErrTimedOut
 			}
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
-				break
-			}
+			break
 		}
 	}
 }
