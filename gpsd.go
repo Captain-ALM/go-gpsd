@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type Session struct {
 	filters map[string][]Filter
 	cond    sync.Cond
 	fErr    error
+	timeout time.Duration
 }
 
 // Mode describes status of a TPV report
@@ -255,7 +257,7 @@ func dialCommon(c net.Conn, err error) (session *Session, e error) {
 	return
 }
 
-// Watch starts watching GPSD reports in a new goroutine.
+// Watch starts watching GPSD reports in a new goroutine without a timeout.
 // Use Activate for a custom watch command
 //
 // Example:
@@ -263,11 +265,28 @@ func dialCommon(c net.Conn, err error) (session *Session, e error) {
 //	gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
 //	_ := gpsd.Watch()
 func (s *Session) Watch() error {
-	return s.Activate("WATCH={\"enable\":true,\"json\":true,\"nmea\":false,\"raw\":0,\"scaled\":false,\"timing\":true,\"split24\":false,\"pps\":true}")
+	return s.WatchWithTimeout(0)
 }
 
-// Activate with a custom command unlike Watch
+// WatchWithTimeout starts watching GPSD reports in a new goroutine with a timeout.
+// Use 0 for no timeout
+// Use ActivateWithTimeout for a custom watch command
+//
+// Example:
+//
+//	gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
+//	_ := gpsd.Watch()
+func (s *Session) WatchWithTimeout(timeout time.Duration) error {
+	return s.ActivateWithTimeout("WATCH={\"enable\":true,\"json\":true,\"nmea\":false,\"raw\":0,\"scaled\":false,\"timing\":true,\"split24\":false,\"pps\":true}", timeout)
+}
+
+// Activate with a custom command unlike Watch with no timeout
 func (s *Session) Activate(customCommand string) error {
+	return s.ActivateWithTimeout(customCommand, 0)
+}
+
+// ActivateWithTimeout ith a custom command unlike Watch with a timeout (0 means no timeout)
+func (s *Session) ActivateWithTimeout(customCommand string, timeout time.Duration) error {
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
 
@@ -281,13 +300,25 @@ func (s *Session) Activate(customCommand string) error {
 
 	s.reader = bufio.NewReader(s.socket)
 
+	s.timeout = timeout
+
 	var err error
-	/*_, err = s.reader.ReadString('\n')
+	/*if timeout > 0 {
+		_ = s.socket.SetReadDeadline(time.Now().Add(timeout))
+	}
+	_, err = s.reader.ReadString('\n')
 	if err != nil {
+	    defer func() {
+			s.socket = nil
+			s.reader = nil
+		}()
 		_ = s.socket.Close()
 		return err
 	}*/
 
+	if timeout > 0 {
+		_ = s.socket.SetWriteDeadline(time.Now().Add(timeout))
+	}
 	_, err = fmt.Fprintf(s.socket, "?"+customCommand+";")
 	if err != nil {
 		defer func() {
@@ -307,6 +338,10 @@ func (s *Session) IsWatching() bool {
 	return s.socket != nil && s.reader != nil
 }
 
+func (s *Session) GetTimeout() time.Duration {
+	return s.timeout
+}
+
 // Wait for the session to close returning an error if any, returns ErrNotWatching if Watch has not been run
 func (s *Session) Wait() error {
 	s.cond.L.Lock()
@@ -321,12 +356,20 @@ func (s *Session) Wait() error {
 	return s.fErr
 }
 
+// FinalError gets the value of the error that would be returned by Wait
+func (s *Session) FinalError() error {
+	return s.fErr
+}
+
 // SendCommand sends a command to GPSD
 func (s *Session) SendCommand(command string) error {
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
 	if s.socket == nil {
 		return ErrConnClosed
+	}
+	if s.timeout > 0 {
+		_ = s.socket.SetWriteDeadline(time.Now().Add(s.timeout))
 	}
 	_, err := fmt.Fprintf(s.socket, "?"+command+";")
 	return err
@@ -417,6 +460,9 @@ func (s *Session) watch() {
 		}
 	}()
 	for {
+		if s.timeout > 0 {
+			_ = s.socket.SetReadDeadline(time.Now().Add(s.timeout))
+		}
 		if line, err := s.reader.ReadString('\n'); err == nil {
 			var reportPeek gpsdReport
 			lineBytes := []byte(line)
@@ -437,7 +483,10 @@ func (s *Session) watch() {
 			if !errors.Is(err, net.ErrClosed) {
 				s.fErr = fmt.Errorf("stream reader error (is gpsd running?): %w", err)
 			}
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				s.fErr = ErrTimedOut
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
 				break
 			}
 		}
