@@ -22,3 +22,8 @@ _testmain.go
 *.exe
 
 examples/examples
+
+*.sqlite
+*.local
+.data
+.idea/
