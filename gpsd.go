@@ -464,7 +464,12 @@ func (s *Session) watch() {
 	}()
 	for {
 		if s.timeout > 0 {
-			_ = s.socket.SetReadDeadline(time.Now().Add(s.timeout))
+			lsocket := s.socket
+			if lsocket == nil {
+				break
+			} else {
+				_ = lsocket.SetReadDeadline(time.Now().Add(s.timeout))
+			}
 		}
 		if line, err := s.reader.ReadString('\n'); err == nil {
 			var reportPeek gpsdReport
